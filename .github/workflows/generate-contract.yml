@@ -2,26 +2,27 @@ name: Sync contract types (reusable)
 
 # Shared contract-sync logic for spider-sdk-* repos, called via `uses:` (see
 # tiducto/spider-sdk-kotlin and tiducto/spider-sdk-typescript for the thin per-repo callers).
-# One released contract version per run ("B2"): reads the caller's marker file
-# (contract/contract-version), finds the SMALLEST released tag in <contract-repo> strictly
-# greater than it, runs the caller's own ./scripts/generate-contract.sh pinned to that tag's
-# SHA, advances the marker, and opens a PR. Merging that PR bumps the marker, whose push
-# re-triggers the caller's workflow — so versions are climbed one at a time until the SDK is
-# current. When no released tag is newer than the marker, the job no-ops green (no PR).
+# One released contract version per run ("B2"): reads the `contract=` field of the caller's
+# version.properties, finds the SMALLEST released tag in <contract-repo> strictly greater than
+# it, runs the caller's own ./scripts/generate-contract.sh pinned to that tag's SHA, bumps
+# `contract=` (and resets `patch=0`), and opens a PR. Merging that PR bumps version.properties,
+# whose push re-triggers the caller's workflow — so versions are climbed one at a time until
+# the SDK is current. When no released tag is newer, the job no-ops green (no PR).
 #
 # Caller contract: a checkout with `scripts/generate-contract.sh` (accepting `--ref <sha>`) and
-# a `contract/contract-version` marker file, plus a CONTRACT_REPO_TOKEN secret (read access to
-# <contract-repo> and tiducto/spider-codegen) passed through via `secrets: inherit`.
+# a `version.properties` file with `contract=<major.minor>` + `patch=<n>` fields, plus a
+# CONTRACT_REPO_TOKEN secret (read access to <contract-repo> and tiducto/spider-codegen) passed
+# through via `secrets: inherit`. The artifact version is `<contract>.<patch>`.
 #
-# The PR carries only whatever `add-paths` lists — typically the generated output dir plus the
-# marker. Anything else the script refreshes (e.g. hand-written-surface pin fixtures) is
-# deliberately left out of add-paths and never committed by this workflow.
+# The PR carries only whatever `add-paths` lists — typically the generated output dir plus
+# version.properties. Anything else the script refreshes (e.g. hand-written-surface pin
+# fixtures) is deliberately left out of add-paths and never committed by this workflow.
 
 on:
   workflow_call:
     inputs:
       add-paths:
-        description: "Newline-separated paths to include in the sync PR (generated output + the marker file)."
+        description: "Newline-separated paths to include in the sync PR (generated output + version.properties)."
         required: true
         type: string
       contract-repo:
@@ -55,18 +56,18 @@ jobs:
         with:
           node-version: "22"
 
-      # Read the marker (the version we're synced to), enumerate released contract tags, and pick the
-      # smallest tag strictly greater than the marker — the next version to sync. Nothing greater ⇒
-      # no-op green. The chosen version is pinned to its commit SHA (annotated tags are dereferenced)
-      # so generation can't race a moving branch.
+      # Read the currently-synced version (version.properties `contract=`), enumerate released contract
+      # tags, and pick the smallest tag strictly greater than it — the next version to sync. Nothing
+      # greater ⇒ no-op green. The chosen version is pinned to its commit SHA (annotated tags are
+      # dereferenced) so generation can't race a moving branch.
       - name: Resolve next version
         id: next
         env:
           GH_TOKEN: ${{ secrets.CONTRACT_REPO_TOKEN }}
           CONTRACT_REPO: ${{ inputs.contract-repo }}
         run: |
-          MARKER=$(cat contract/contract-version)
-          echo "Marker (currently synced): v$MARKER"
+          MARKER=$(sed -n 's/^contract=//p' version.properties)
+          echo "Currently synced: v$MARKER"
 
           # Released versions are tags v<major>.<minor>; strip the leading v. grep may match nothing
           # (no tags released yet) — tolerate that so the job stays green.
@@ -113,9 +114,14 @@ jobs:
           CONTRACT_REPO: ${{ inputs.contract-repo }}
         run: ./scripts/generate-contract.sh --ref "${{ steps.next.outputs.sha }}"
 
-      - name: Update version marker
+      # A new contract line starts a fresh patch sequence, so bumping contract resets patch to 0.
+      - name: Bump version.properties
         if: steps.next.outputs.has == 'true'
-        run: printf '%s\n' "${{ steps.next.outputs.ver }}" > contract/contract-version
+        run: |
+          sed -i \
+            -e "s/^contract=.*/contract=${{ steps.next.outputs.ver }}/" \
+            -e "s/^patch=.*/patch=0/" \
+            version.properties
 
       - name: Open PR
         if: steps.next.outputs.has == 'true'
@@ -134,7 +140,7 @@ jobs:
             [`${{ inputs.contract-repo }}`](https://github.com/${{ inputs.contract-repo }}) **v${{ steps.next.outputs.ver }}** (`${{ steps.next.outputs.sha }}`)
             via `scripts/generate-contract.sh`.
 
-            Advances the version marker `contract/contract-version` to **${{ steps.next.outputs.ver }}**.
+            Bumps `version.properties` to `contract=${{ steps.next.outputs.ver }}` (patch reset to 0).
 
             Generated code — review the API-surface diff, don't hand-edit.
           delete-branch: true
