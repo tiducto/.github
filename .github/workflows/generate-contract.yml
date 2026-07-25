@@ -1,0 +1,140 @@
+name: Sync contract types (reusable)
+
+# Shared contract-sync logic for spider-sdk-* repos, called via `uses:` (see
+# tiducto/spider-sdk-kotlin and tiducto/spider-sdk-typescript for the thin per-repo callers).
+# One released contract version per run ("B2"): reads the caller's marker file
+# (contract/contract-version), finds the SMALLEST released tag in <contract-repo> strictly
+# greater than it, runs the caller's own ./scripts/generate-contract.sh pinned to that tag's
+# SHA, advances the marker, and opens a PR. Merging that PR bumps the marker, whose push
+# re-triggers the caller's workflow — so versions are climbed one at a time until the SDK is
+# current. When no released tag is newer than the marker, the job no-ops green (no PR).
+#
+# Caller contract: a checkout with `scripts/generate-contract.sh` (accepting `--ref <sha>`) and
+# a `contract/contract-version` marker file, plus a CONTRACT_REPO_TOKEN secret (read access to
+# <contract-repo> and tiducto/spider-codegen) passed through via `secrets: inherit`.
+#
+# The PR carries only whatever `add-paths` lists — typically the generated output dir plus the
+# marker. Anything else the script refreshes (e.g. hand-written-surface pin fixtures) is
+# deliberately left out of add-paths and never committed by this workflow.
+
+on:
+  workflow_call:
+    inputs:
+      add-paths:
+        description: "Newline-separated paths to include in the sync PR (generated output + the marker file)."
+        required: true
+        type: string
+      contract-repo:
+        description: "owner/repo of the source contract."
+        required: false
+        type: string
+        default: tiducto/spider-contract
+      base-branch:
+        description: "Branch the sync PR targets."
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: contract-sync
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      # Read the marker (the version we're synced to), enumerate released contract tags, and pick the
+      # smallest tag strictly greater than the marker — the next version to sync. Nothing greater ⇒
+      # no-op green. The chosen version is pinned to its commit SHA (annotated tags are dereferenced)
+      # so generation can't race a moving branch.
+      - name: Resolve next version
+        id: next
+        env:
+          GH_TOKEN: ${{ secrets.CONTRACT_REPO_TOKEN }}
+          CONTRACT_REPO: ${{ inputs.contract-repo }}
+        run: |
+          MARKER=$(cat contract/contract-version)
+          echo "Marker (currently synced): v$MARKER"
+
+          # Released versions are tags v<major>.<minor>; strip the leading v. grep may match nothing
+          # (no tags released yet) — tolerate that so the job stays green.
+          TAGS=$(gh api --paginate "repos/$CONTRACT_REPO/tags" --jq '.[].name' \
+            | grep -E '^v[0-9]' | sed 's/^v//' || true)
+
+          # Ascending version sort; take the first entry strictly greater than the marker.
+          NEXT=""
+          for v in $(printf '%s\n' "$TAGS" | sort -V -u); do
+            [ -z "$v" ] && continue
+            if [ "$v" != "$MARKER" ] \
+              && [ "$(printf '%s\n%s\n' "$MARKER" "$v" | sort -V | head -1)" = "$MARKER" ]; then
+              NEXT="$v"
+              break
+            fi
+          done
+
+          if [ -z "$NEXT" ]; then
+            echo "SDK already current at v$MARKER"
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve the tag to a commit SHA, dereferencing annotated tags to the commit they point at.
+          REF=$(gh api "repos/$CONTRACT_REPO/git/refs/tags/v$NEXT")
+          SHA=$(printf '%s' "$REF" | jq -r '.object.sha')
+          TYPE=$(printf '%s' "$REF" | jq -r '.object.type')
+          if [ "$TYPE" = "tag" ]; then
+            SHA=$(gh api "repos/$CONTRACT_REPO/git/tags/$SHA" --jq '.object.sha')
+          fi
+
+          echo "Next version to sync: v$NEXT ($SHA)"
+          {
+            echo "has=true"
+            echo "ver=$NEXT"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate contract types
+        if: steps.next.outputs.has == 'true'
+        env:
+          # Reads the private contract AND spider-codegen repos; PR creation below uses the default GITHUB_TOKEN.
+          CONTRACT_REPO_TOKEN: ${{ secrets.CONTRACT_REPO_TOKEN }}
+          CONTRACT_REPO: ${{ inputs.contract-repo }}
+        run: ./scripts/generate-contract.sh --ref "${{ steps.next.outputs.sha }}"
+
+      - name: Update version marker
+        if: steps.next.outputs.has == 'true'
+        run: printf '%s\n' "${{ steps.next.outputs.ver }}" > contract/contract-version
+
+      - name: Open PR
+        if: steps.next.outputs.has == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          # One PR per contract version; re-running the same version updates its PR.
+          branch: contract/v${{ steps.next.outputs.ver }}
+          base: ${{ inputs.base-branch }}
+          # Tag the auto-generated sync PRs so they're easy to filter (and for any auto-merge/CODEOWNERS rules).
+          labels: contract-sync
+          add-paths: ${{ inputs.add-paths }}
+          title: "chore(contract): sync SDK to spider-contract v${{ steps.next.outputs.ver }}"
+          commit-message: "chore(contract): sync SDK to spider-contract v${{ steps.next.outputs.ver }}"
+          body: |
+            Syncs the generated contract types to
+            [`${{ inputs.contract-repo }}`](https://github.com/${{ inputs.contract-repo }}) **v${{ steps.next.outputs.ver }}** (`${{ steps.next.outputs.sha }}`)
+            via `scripts/generate-contract.sh`.
+
+            Advances the version marker `contract/contract-version` to **${{ steps.next.outputs.ver }}**.
+
+            Generated code — review the API-surface diff, don't hand-edit.
+          delete-branch: true
