@@ -65,6 +65,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CONTRACT_REPO_TOKEN }}
           CONTRACT_REPO: ${{ inputs.contract-repo }}
+          # The caller repo's own token: CONTRACT_REPO_TOKEN is scoped to the contract/codegen repos and can't
+          # read THIS repo's PRs, which we consult below to honour "closed sync PR = skip this version".
+          SDK_PR_TOKEN: ${{ github.token }}
         run: |
           MARKER=$(sed -n 's/^contract=//p' version.properties)
           echo "Currently synced: v$MARKER"
@@ -74,15 +77,24 @@ jobs:
           TAGS=$(gh api --paginate "repos/$CONTRACT_REPO/tags" --jq '.[].name' \
             | grep -E '^v[0-9]' | sed 's/^v//' || true)
 
-          # Ascending version sort; take the first entry strictly greater than the marker.
+          # Ascending version sort; take the first entry strictly greater than the marker — but skip any
+          # version whose sync PR was closed unmerged. An operator closing contract/v<ver> is telling us to
+          # skip that version (jump past it). Merged PRs advance the marker so they never reach here; deleting
+          # the PR record leaves nothing to find, making the version eligible again.
           NEXT=""
           for v in $(printf '%s\n' "$TAGS" | sort -V -u); do
             [ -z "$v" ] && continue
-            if [ "$v" != "$MARKER" ] \
-              && [ "$(printf '%s\n%s\n' "$MARKER" "$v" | sort -V | head -1)" = "$MARKER" ]; then
-              NEXT="$v"
-              break
+            [ "$v" = "$MARKER" ] && continue
+            [ "$(printf '%s\n%s\n' "$MARKER" "$v" | sort -V | head -1)" != "$MARKER" ] && continue
+            CLOSED=$(GH_TOKEN="$SDK_PR_TOKEN" gh pr list --repo "$GITHUB_REPOSITORY" \
+              --state closed --head "contract/v$v" --json mergedAt \
+              --jq '[.[] | select(.mergedAt == null)] | length')
+            if [ "${CLOSED:-0}" -gt 0 ]; then
+              echo "v$v: sync PR was closed unmerged — skipping (operator opted out of this version)."
+              continue
             fi
+            NEXT="$v"
+            break
           done
 
           if [ -z "$NEXT" ]; then
