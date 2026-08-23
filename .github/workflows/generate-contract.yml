@@ -39,7 +39,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write # start the SDK's "Build SDK" check on the sync PR via workflow_dispatch
 
 concurrency:
   group: contract-sync
@@ -137,7 +136,6 @@ jobs:
             version.properties
 
       - name: Open PR
-        id: cpr
         if: steps.next.outputs.has == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
@@ -158,16 +156,3 @@ jobs:
 
             Generated code — review the API-surface diff, don't hand-edit.
           delete-branch: true
-
-      # The sync PR is opened with GITHUB_TOKEN, which by GitHub's loop-prevention does NOT trigger the
-      # SDK's build workflow. workflow_dispatch is the documented exception, so start "Build SDK" on the
-      # sync branch explicitly — its check lands on the PR head, so the operator sees whether the new
-      # contract still COMPILES before reviewing the API-surface diff. No auto-merge on purpose: buildable
-      # != correct (a silently-dropped mapping still compiles), so a human always reviews and merges.
-      - name: Start build check on the sync PR
-        if: steps.cpr.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "contract/v${{ steps.next.outputs.ver }}" \
-            || echo "::warning::Could not start Build SDK on the sync branch — start it manually from the Actions tab."
