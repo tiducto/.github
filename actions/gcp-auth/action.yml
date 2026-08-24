@@ -1,0 +1,57 @@
+name: gcp-auth
+description: >-
+  Keyless GCP auth for GitHub Actions via Workload Identity Federation — mints a short-lived token
+  by impersonating a CI service account (the org forbids SA keys). Optionally logs Docker into
+  Artifact Registry and/or installs the gcloud CLI. Shared across every tiducto repo that touches GCP.
+
+# The calling JOB must declare these permissions (a composite action can't set them itself):
+#   permissions:
+#     contents: read
+#     id-token: write      # required — this is what lets WIF mint the OIDC token
+# Pair the inputs with the org-level Actions variables (set by setup-org-ci-vars.sh):
+#   workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+#   service_account:            ${{ vars.GCP_CI_SA }}   # or a job-specific *_SA
+#   registry:                   ${{ vars.AR_HOST }}     # only for jobs that push/pull images
+
+inputs:
+  workload_identity_provider:
+    description: Full WIF provider resource name (projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>).
+    required: true
+  service_account:
+    description: Service-account email to impersonate. Use the least-privileged SA for the job (image push vs. bench).
+    required: true
+  registry:
+    description: Artifact Registry host to docker-login (e.g. europe-west4-docker.pkg.dev). Leave empty to skip Docker login.
+    required: false
+    default: ""
+  setup_gcloud:
+    description: "'true' to also install the gcloud CLI (needed by jobs that run gcloud/gsutil/pulumi)."
+    required: false
+    default: "false"
+
+outputs:
+  access_token:
+    description: Short-lived OAuth access token for the impersonated service account.
+    value: ${{ steps.auth.outputs.access_token }}
+
+runs:
+  using: composite
+  steps:
+    - id: auth
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+        token_format: access_token
+
+    - name: Install gcloud CLI
+      if: ${{ inputs.setup_gcloud == 'true' }}
+      uses: google-github-actions/setup-gcloud@v3
+
+    - name: Docker login to Artifact Registry
+      if: ${{ inputs.registry != '' }}
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
