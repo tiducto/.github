@@ -103,6 +103,16 @@ jobs:
             exit 0
           fi
 
+          # An open sync PR is being finished by hand (release commits ride on its branch), so it is left
+          # as it is: regenerating would force-push over those commits.
+          OPEN=$(GH_TOKEN="$SDK_PR_TOKEN" gh pr list --repo "$GITHUB_REPOSITORY" \
+            --state open --head "contract/v$NEXT" --json number --jq 'length')
+          if [ "${OPEN:-0}" -gt 0 ]; then
+            echo "v$NEXT: sync PR already open — leaving it as it is."
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Resolve the tag to a commit SHA, dereferencing annotated tags to the commit they point at.
           REF=$(gh api "repos/$CONTRACT_REPO/git/refs/tags/v$NEXT")
           SHA=$(printf '%s' "$REF" | jq -r '.object.sha')
@@ -139,7 +149,7 @@ jobs:
         if: steps.next.outputs.has == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          # One PR per contract version; re-running the same version updates its PR.
+          # One PR per contract version; once open, later runs leave it alone (see Resolve next version).
           branch: contract/v${{ steps.next.outputs.ver }}
           base: ${{ inputs.base-branch }}
           # Tag the auto-generated sync PRs so they're easy to filter (and for any auto-merge/CODEOWNERS rules).
