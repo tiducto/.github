@@ -14,15 +14,15 @@ name: Sync contract types (reusable)
 # CONTRACT_REPO_TOKEN secret (read access to <contract-repo> and tiducto/spider-codegen) passed
 # through via `secrets: inherit`. The artifact version is `<contract>.<patch>`.
 #
-# The PR carries only whatever `add-paths` lists — typically the generated output dir plus
-# version.properties. Anything else the script refreshes (e.g. hand-written-surface pin
-# fixtures) is deliberately left out of add-paths and never committed by this workflow.
+# The PR carries only whatever `add-paths` lists: the generated output, version.properties, and
+# any pin fixtures the script refreshes, so a contract change the hand-written surface hasn't
+# caught up with fails the sync PR's build.
 
 on:
   workflow_call:
     inputs:
       add-paths:
-        description: "Newline-separated paths to include in the sync PR (generated output + version.properties)."
+        description: "Newline-separated paths to include in the sync PR (generated output, version.properties, pin fixtures)."
         required: true
         type: string
       contract-repo:
