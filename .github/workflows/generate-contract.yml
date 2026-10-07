@@ -72,10 +72,15 @@ jobs:
           MARKER=$(sed -n 's/^contract=//p' version.properties)
           echo "Currently synced: v$MARKER"
 
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::CONTRACT_REPO_TOKEN is not set for $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
           # Released versions are tags v<major>.<minor>; strip the leading v. grep may match nothing
           # (no tags released yet) — tolerate that so the job stays green.
-          TAGS=$(gh api --paginate "repos/$CONTRACT_REPO/tags" --jq '.[].name' \
-            | grep -E '^v[0-9]' | sed 's/^v//' || true)
+          ALL_TAGS=$(gh api --paginate "repos/$CONTRACT_REPO/tags" --jq '.[].name')
+          TAGS=$(printf '%s\n' "$ALL_TAGS" | grep -E '^v[0-9]' | sed 's/^v//' || true)
 
           # Ascending version sort; take the first entry strictly greater than the marker — but skip any
           # version whose sync PR was closed unmerged. An operator closing contract/v<ver> is telling us to
