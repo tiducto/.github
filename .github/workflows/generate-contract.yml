@@ -17,6 +17,14 @@ name: Sync contract types (reusable)
 # The PR carries only whatever `add-paths` lists: the generated output, version.properties, and
 # any pin fixtures the script refreshes, so a contract change the hand-written surface hasn't
 # caught up with fails the sync PR's build.
+#
+# With `follow_generations: true` (spider-docs, which renders the contract's prose) a caller also
+# follows same-version generations: when no newer tag exists and <contract-repo> `main`'s
+# dist/manifest.json is at the caller's `contract=` version with a `generation` other than the
+# caller's recorded `contract_generation=`, it regenerates from that `main` commit and opens a
+# PR on `contract/v<version>-<generation>`. A newer version on `main` that has no tag yet is never
+# followed. Such a caller records `contract_generation=` on every sync; other callers never get it.
+# A generation whose regeneration changes nothing but version.properties opens no PR.
 
 on:
   workflow_call:
@@ -35,6 +43,11 @@ on:
         required: false
         type: string
         default: main
+      follow_generations:
+        description: "Also sync same-version generations of the synced contract version from the contract repo's main."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -68,6 +81,7 @@ jobs:
           # The caller repo's own token: CONTRACT_REPO_TOKEN is scoped to the contract/codegen repos and can't
           # read THIS repo's PRs, which we consult below to honour "closed sync PR = skip this version".
           SDK_PR_TOKEN: ${{ github.token }}
+          FOLLOW_GENERATIONS: ${{ inputs.follow_generations }}
         run: |
           MARKER=$(sed -n 's/^contract=//p' version.properties)
           echo "Currently synced: v$MARKER"
@@ -102,6 +116,47 @@ jobs:
             break
           done
 
+          manifest_at() {
+            gh api "repos/$CONTRACT_REPO/contents/dist/manifest.json?ref=$1" -H "Accept: application/vnd.github.raw"
+          }
+
+          KIND=version
+          GEN=""
+          if [ -n "$NEXT" ]; then
+            BRANCH="contract/v$NEXT"
+            # Resolve the tag to a commit SHA, dereferencing annotated tags to the commit they point at.
+            REF=$(gh api "repos/$CONTRACT_REPO/git/refs/tags/v$NEXT")
+            SHA=$(printf '%s' "$REF" | jq -r '.object.sha')
+            TYPE=$(printf '%s' "$REF" | jq -r '.object.type')
+            if [ "$TYPE" = "tag" ]; then
+              SHA=$(gh api "repos/$CONTRACT_REPO/git/tags/$SHA" --jq '.object.sha')
+            fi
+            if [ "$FOLLOW_GENERATIONS" = "true" ]; then
+              GEN=$(manifest_at "$SHA" | jq -r '.generation // empty' || true)
+            fi
+          elif [ "$FOLLOW_GENERATIONS" = "true" ]; then
+            # Only a generation of the synced version follows main; a newer version there waits for its tag.
+            SHA=$(gh api "repos/$CONTRACT_REPO/commits/main" --jq '.sha')
+            MANIFEST=$(manifest_at "$SHA")
+            MAIN_VER=$(printf '%s' "$MANIFEST" | jq -r '.version')
+            MAIN_GEN=$(printf '%s' "$MANIFEST" | jq -r '.generation // empty')
+            RECORDED=$(sed -n 's/^contract_generation=//p' version.properties)
+            echo "main @ $SHA: v$MAIN_VER generation ${MAIN_GEN:-none} (recorded: ${RECORDED:-none})"
+            if [ "$MAIN_VER" = "$MARKER" ] && [ -n "$MAIN_GEN" ] && [ "$MAIN_GEN" != "$RECORDED" ]; then
+              BRANCH="contract/v$MARKER-$MAIN_GEN"
+              CLOSED=$(GH_TOKEN="$SDK_PR_TOKEN" gh pr list --repo "$GITHUB_REPOSITORY" \
+                --state closed --head "$BRANCH" --json mergedAt \
+                --jq '[.[] | select(.mergedAt == null)] | length')
+              if [ "${CLOSED:-0}" -gt 0 ]; then
+                echo "v$MARKER generation $MAIN_GEN: sync PR was closed unmerged — skipping."
+              else
+                NEXT="$MARKER"
+                GEN="$MAIN_GEN"
+                KIND=generation
+              fi
+            fi
+          fi
+
           if [ -z "$NEXT" ]; then
             echo "SDK already current at v$MARKER"
             echo "has=false" >> "$GITHUB_OUTPUT"
@@ -111,26 +166,27 @@ jobs:
           # An open sync PR is being finished by hand (release commits ride on its branch), so it is left
           # as it is: regenerating would force-push over those commits.
           OPEN=$(GH_TOKEN="$SDK_PR_TOKEN" gh pr list --repo "$GITHUB_REPOSITORY" \
-            --state open --head "contract/v$NEXT" --json number --jq 'length')
+            --state open --head "$BRANCH" --json number --jq 'length')
           if [ "${OPEN:-0}" -gt 0 ]; then
-            echo "v$NEXT: sync PR already open — leaving it as it is."
+            echo "$BRANCH: sync PR already open — leaving it as it is."
             echo "has=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Resolve the tag to a commit SHA, dereferencing annotated tags to the commit they point at.
-          REF=$(gh api "repos/$CONTRACT_REPO/git/refs/tags/v$NEXT")
-          SHA=$(printf '%s' "$REF" | jq -r '.object.sha')
-          TYPE=$(printf '%s' "$REF" | jq -r '.object.type')
-          if [ "$TYPE" = "tag" ]; then
-            SHA=$(gh api "repos/$CONTRACT_REPO/git/tags/$SHA" --jq '.object.sha')
+          if [ "$KIND" = "generation" ]; then
+            LABEL="v$NEXT generation $GEN"
+          else
+            LABEL="v$NEXT"
           fi
-
-          echo "Next version to sync: v$NEXT ($SHA)"
+          echo "Next to sync: $LABEL ($SHA)"
           {
             echo "has=true"
+            echo "kind=$KIND"
             echo "ver=$NEXT"
+            echo "gen=$GEN"
             echo "sha=$SHA"
+            echo "branch=$BRANCH"
+            echo "label=$LABEL"
           } >> "$GITHUB_OUTPUT"
 
       - name: Regenerate contract types
@@ -141,33 +197,76 @@ jobs:
           CONTRACT_REPO: ${{ inputs.contract-repo }}
         run: ./scripts/generate-contract.sh --ref "${{ steps.next.outputs.sha }}"
 
-      # A new contract line starts a fresh patch sequence, so bumping contract resets patch to 0.
-      - name: Bump version.properties
-        if: steps.next.outputs.has == 'true'
+      # A generation that regenerates to the same files carries nothing to review, so it opens no PR; its
+      # generation is recorded by the next sync that does.
+      - name: Check generation diff
+        id: diff
+        if: steps.next.outputs.kind == 'generation'
+        env:
+          ADD_PATHS: ${{ inputs.add-paths }}
+          GEN: ${{ steps.next.outputs.gen }}
         run: |
-          sed -i \
-            -e "s/^contract=.*/contract=${{ steps.next.outputs.ver }}/" \
-            -e "s/^patch=.*/patch=0/" \
-            version.properties
+          PATHS=()
+          while IFS= read -r p; do
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            if [ -n "$p" ] && [ "$p" != "version.properties" ]; then
+              PATHS+=("$p")
+            fi
+          done <<< "$ADD_PATHS"
+          CHANGED=""
+          if [ "${#PATHS[@]}" -gt 0 ]; then
+            CHANGED=$(git status --porcelain --untracked-files=all -- "${PATHS[@]}")
+          fi
+          if [ -z "$CHANGED" ]; then
+            echo "Generation $GEN regenerates to the same files — no PR."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A new contract line starts a fresh patch sequence, so bumping contract resets patch to 0. A generation
+      # of the synced version leaves contract and patch as they are.
+      - name: Bump version.properties
+        if: steps.next.outputs.has == 'true' && steps.diff.outputs.changed != 'false'
+        env:
+          KIND: ${{ steps.next.outputs.kind }}
+          VER: ${{ steps.next.outputs.ver }}
+          GEN: ${{ steps.next.outputs.gen }}
+        run: |
+          if [ "$KIND" = "version" ]; then
+            sed -i -e "s/^contract=.*/contract=$VER/" -e "s/^patch=.*/patch=0/" version.properties
+          fi
+          if [ -n "$GEN" ]; then
+            if grep -q '^contract_generation=' version.properties; then
+              sed -i "s/^contract_generation=.*/contract_generation=$GEN/" version.properties
+            else
+              if [ -n "$(tail -c1 version.properties)" ]; then
+                echo >> version.properties
+              fi
+              echo "contract_generation=$GEN" >> version.properties
+            fi
+          fi
 
       - name: Open PR
-        if: steps.next.outputs.has == 'true'
+        if: steps.next.outputs.has == 'true' && steps.diff.outputs.changed != 'false'
         uses: peter-evans/create-pull-request@v8
         with:
-          # One PR per contract version; once open, later runs leave it alone (see Resolve next version).
-          branch: contract/v${{ steps.next.outputs.ver }}
+          # One PR per contract version or followed generation; once open, later runs leave it alone (see
+          # Resolve next version).
+          branch: ${{ steps.next.outputs.branch }}
           base: ${{ inputs.base-branch }}
           # Tag the auto-generated sync PRs so they're easy to filter (and for any auto-merge/CODEOWNERS rules).
           labels: contract-sync
           add-paths: ${{ inputs.add-paths }}
-          title: "chore(contract): sync SDK to spider-contract v${{ steps.next.outputs.ver }}"
-          commit-message: "chore(contract): sync SDK to spider-contract v${{ steps.next.outputs.ver }}"
+          title: "chore(contract): sync SDK to spider-contract ${{ steps.next.outputs.label }}"
+          commit-message: "chore(contract): sync SDK to spider-contract ${{ steps.next.outputs.label }}"
           body: |
             Syncs the generated contract types to
-            [`${{ inputs.contract-repo }}`](https://github.com/${{ inputs.contract-repo }}) **v${{ steps.next.outputs.ver }}** (`${{ steps.next.outputs.sha }}`)
+            [`${{ inputs.contract-repo }}`](https://github.com/${{ inputs.contract-repo }}) **${{ steps.next.outputs.label }}** (`${{ steps.next.outputs.sha }}`)
             via `scripts/generate-contract.sh`.
 
-            Bumps `version.properties` to `contract=${{ steps.next.outputs.ver }}` (patch reset to 0).
+            ${{ steps.next.outputs.kind == 'generation' && format('A documentation-only generation of v{0} from `main`; records `contract_generation={1}` in `version.properties`.', steps.next.outputs.ver, steps.next.outputs.gen) || format('Bumps `version.properties` to `contract={0}` (patch reset to 0).', steps.next.outputs.ver) }}
 
             Generated code — review the API-surface diff, don't hand-edit.
           delete-branch: true
